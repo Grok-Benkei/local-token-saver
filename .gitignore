@@ -1,1 +1,8 @@
-$file:/workspace/local-token-saver-repo/.gitignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+.DS_Store
+.env
