@@ -379,8 +379,51 @@ def detect_format(text: str, filename: str = "") -> str:
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_ATTR_RE = re.compile(
-    r"(?:password|passwd|pwd|secret|token|csrf|xsrf|auth|api[-_]?key|session|credit[-_]?card|cvv|cvc)",
+    r"(?:password|passwd|pwd|secret|token|csrf|xsrf|auth|api[-_]?key|session|credit[-_]?card|cvv|cvc|nonce|state|verifier|challenge|saml| RelayState|signature|sig|jwt|bearer|credential)",
     re.IGNORECASE,
+)
+
+_SAFE_HIDDEN_INPUT_NAMES: frozenset[str] = frozenset(
+    {
+        "id",
+        "uid",
+        "userid",
+        "itemid",
+        "productid",
+        "orderid",
+        "categoryid",
+        "page",
+        "perpage",
+        "limit",
+        "offset",
+        "sort",
+        "order",
+        "lang",
+        "locale",
+        "hl",
+        "gl",
+        "q",
+        "query",
+        "search",
+        "type",
+        "mode",
+        "action",
+        "step",
+        "tab",
+        "view",
+        "format",
+        "redirect",
+        "returnurl",
+        "next",
+        "back",
+        "ref",
+        "source",
+        "currency",
+        "country",
+        "timezone",
+        "tz",
+        "utf8",
+    }
 )
 
 _WINDOW_STATE_ASSIGNMENTS = [
@@ -733,6 +776,7 @@ class _CompactHTMLParser(HTMLParser):
         value = attr_map.get("value") or ""
 
         if inp_type == "hidden":
+            norm_hidden_name = re.sub(r"[^a-z0-9]", "", name.lower())
             if (
                 name
                 and not _is_sensitive_key(name)
@@ -740,6 +784,11 @@ class _CompactHTMLParser(HTMLParser):
                 and value
                 and not _SECRET_VALUE_RE.search(value)
                 and len(value) <= 64
+                and (
+                    norm_hidden_name in _SAFE_HIDDEN_INPUT_NAMES
+                    or norm_hidden_name.endswith(("id", "page", "mode", "type", "step", "lang", "locale"))
+                    or (len(value) <= 24 and re.fullmatch(r"[0-9]+|[a-zA-Z0-9_./:-]{1,16}", value) is not None)
+                )
             ):
                 self._emit(f" [Hidden: {name}={value}] ")
             return
@@ -1232,6 +1281,22 @@ SENSITIVE_JSON_KEYS = {
     "signing_secret",
     "master_key",
     "bearer",
+    "bearer_token",
+    "jwt",
+    "jwt_token",
+    "oauth_token",
+    "api_token",
+    "x_auth_token",
+    "authenticity_token",
+    "code_verifier",
+    "recovery_code",
+    "totp",
+    "otp",
+    "pin",
+    "cvv",
+    "cvc",
+    "passphrase",
+    "credentials",
 }
 
 SENSITIVE_KEY_NORMS: frozenset[str] = frozenset(
@@ -1257,6 +1322,20 @@ SENSITIVE_KEY_NORM_SUFFIXES: tuple[str, ...] = (
     "webhooksecret",
     "signingsecret",
     "masterkey",
+    "bearertoken",
+    "jwttoken",
+    "oauthtoken",
+    "apitoken",
+    "xauthtoken",
+    "authenticitytoken",
+    "securitytoken",
+    "resettoken",
+    "verifymailtoken",
+    "verificationtoken",
+    "codeverifier",
+    "passphrase",
+    "privatekeypem",
+    "clientcertificate",
 )
 
 _SAFE_TOKEN_KEY_NORMS: frozenset[str] = frozenset(
@@ -1584,14 +1663,20 @@ def slim_csv_text(
                 pass
 
     def _fmt_dec(d: Decimal) -> str:
-        if d == d.to_integral_value():
-            return str(d.to_integral_value())
-        # Preserve significant decimal precision (e.g. 0.00045 or 1234.5678) without float conversion
-        quantized = d.quantize(Decimal("0.000001")) if abs(d) >= Decimal("0.000001") else d.normalize()
-        s = format(quantized.normalize(), "f")
-        if "." in s:
-            s = s.rstrip("0").rstrip(".")
-        return s or "0"
+        try:
+            if d == d.to_integral_value():
+                return format(d.to_integral_value(), "f")
+            # Preserve significant decimal precision (e.g. 0.00045 or 1234.5678) without float conversion
+            quantized = d.quantize(Decimal("0.000001")) if abs(d) >= Decimal("0.000001") else d.normalize()
+            s = format(quantized.normalize(), "f")
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s or "0"
+        except InvalidOperation:
+            s = format(d.normalize(), "f")
+            if "." in s:
+                s = s.rstrip("0").rstrip(".")
+            return s or "0"
 
     def _fmt_row(r: list[str]) -> str:
         cells = []
@@ -2225,7 +2310,11 @@ def batch_slim_files(
         else:
             out_path = fpath.with_name(fpath.name + ".slim")
 
-        out_path.write_text(slimmed, encoding="utf-8")
+        try:
+            out_path.write_text(slimmed, encoding="utf-8")
+        except Exception as exc:
+            results.append({"file": str(fpath), "error": str(exc)})
+            continue
 
         saved_pct = round((1.0 - after_tok / max(1, before_tok)) * 100, 1)
         results.append(
@@ -2240,8 +2329,11 @@ def batch_slim_files(
         )
 
     overall_pct = round((1.0 - total_after / max(1, total_before)) * 100, 1) if total_before else 0.0
+    succeeded_count = sum(1 for item in results if "output_file" in item)
+    failed_count = sum(1 for item in results if "error" in item)
     return {
-        "files_processed": len(results),
+        "files_processed": succeeded_count,
+        "files_failed": failed_count,
         "tokens_before": total_before,
         "tokens_after": total_after,
         "tokens_saved": max(0, total_before - total_after),
@@ -2269,10 +2361,25 @@ class LocalStateStore:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
+    def _secure_db_files(self) -> None:
+        """Ensure main SQLite DB and any WAL/SHM sidecar files are mode 0600 (owner read/write only)."""
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            candidate = Path(f"{self.db_path}{suffix}")
+            try:
+                if candidate.exists():
+                    os.chmod(candidate, 0o600)
+            except OSError:
+                pass
+
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
+        old_umask = os.umask(0o177)
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=10.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA synchronous=NORMAL;")
+        finally:
+            os.umask(old_umask)
+        self._secure_db_files()
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -2417,12 +2524,8 @@ class LocalStateStore:
                 """
             )
 
-        # Restrict SQLite state DB file permissions to owner read/write (0600)
-        try:
-            if self.db_path.exists():
-                os.chmod(self.db_path, 0o600)
-        except OSError:
-            pass
+        # Restrict SQLite state DB + WAL/SHM sidecar file permissions to owner read/write (0600)
+        self._secure_db_files()
 
     @staticmethod
     def _hash_key(query_text: str, namespace: str = "default") -> str:
@@ -3035,6 +3138,13 @@ def run_selftest() -> dict[str, Any]:
         _check(batch_summary["files_processed"] == 3 and batch_summary["saved_pct"] > 80.0, "batch-slim failed")
         out_files = {p.name for p in out_batch.iterdir()}
         _check(len(out_files) == 3, f"batch-slim collided on duplicate basenames: {out_files}")
+        _check(_is_sensitive_key("bearer_token") and _is_sensitive_key("jwt") and _is_sensitive_key("jwt_token"), "bearer_token/jwt/jwt_token must be sensitive")
+        huge_csv = "x\n" + ("9" * 40) + ".5\n"
+        _check("rows=1" in slim_csv_text(huge_csv), "huge Decimal CSV failed")
+        for suf in ("", "-wal", "-shm"):
+            db_cand = Path(f"{store.db_path}{suf}")
+            if db_cand.exists():
+                _check((db_cand.stat().st_mode & 0o777) == 0o600, f"{db_cand.name} mode is not 0600")
 
         benchmarks = {}
         for name, b, a in [
@@ -3076,6 +3186,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="token-saver",
         description="Zero-dependency local token reduction toolkit for AI agents & Browser Use (v2.0.0).",
+    )
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     parser.add_argument(
         "--db",
