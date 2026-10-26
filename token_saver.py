@@ -85,7 +85,7 @@ import tempfile
 import time
 import unicodedata
 import urllib.parse
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -337,38 +337,43 @@ def detect_format(text: str, filename: str = "") -> str:
             return "aria"
 
     if re.search(
-        r"<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]|<div[\s>]|<table[\s>]|<article[\s>]|<form[\s>]",
+        r"<!doctype\s+html|<html[\s>]|<head[\s>]|<body[\s>]|<div[\s>]|<table[\s>]|<article[\s>]|<form[\s>]|<section[\s>]|<main[\s>]|<nav[\s>]|<p[\s>]|<span[\s>]|<ul[\s>]|<ol[\s>]",
         sample,
         re.IGNORECASE,
     ):
         return "html"
 
     if sample[0] in "{[":
+        try:
+            json.loads(text)
+            return "json"
+        except Exception:
+            pass
         lines = [ln.strip() for ln in sample.splitlines() if ln.strip()]
-        if len(lines) >= 2 and all(ln.startswith("{") and ln.endswith("}") for ln in lines[:3]):
+        if len(lines) >= 2 and all(
+            (ln.startswith("{") and ln.endswith("}")) or (ln.startswith("[") and ln.endswith("]"))
+            for ln in lines[:3]
+        ):
             try:
                 json.loads(lines[0])
                 json.loads(lines[1])
                 return "jsonl"
             except Exception:
                 pass
-        try:
-            json.loads(text)
-            return "json"
-        except Exception:
-            pass
 
     md_headings = len(re.findall(r"(?m)^#{1,6}\s+\S+", sample))
     if md_headings >= 2:
         return "markdown"
 
     first_lines = [ln for ln in sample.splitlines()[:10] if ln.strip()]
-    if len(first_lines) >= 3:
+    if len(first_lines) >= 2:
         tab_counts = [ln.count("\t") for ln in first_lines[:5]]
-        if min(tab_counts) >= 2 and len(set(tab_counts)) == 1:
+        if min(tab_counts) >= 1 and len(set(tab_counts)) == 1:
             return "tsv"
         comma_counts = [ln.count(",") for ln in first_lines[:5]]
-        if min(comma_counts) >= 2 and len(set(comma_counts)) <= 2:
+        if min(comma_counts) >= 1 and len(set(comma_counts)) <= 2 and all(
+            not ln.lstrip().startswith(("#", "-", "*", "{", "[", "<")) for ln in first_lines[:3]
+        ):
             return "csv"
 
     return "cli"
@@ -691,6 +696,14 @@ class _CompactHTMLParser(HTMLParser):
 
         if t in self.INLINE_TAGS:
             self._ensure_inline_space()
+            if t == "span":
+                role = attr_map.get("role", "").strip().lower()
+                aria_label = (attr_map.get("aria-label") or attr_map.get("title") or "").strip()
+                if aria_label:
+                    if role in {"button", "link", "tab", "menuitem", "switch", "checkbox", "searchbox", "textbox", "img", "icon"}:
+                        self._emit(f"[{role.capitalize()}: {aria_label}] ")
+                    elif self.browser_mode or "onclick" in attr_map or "tabindex" in attr_map or attr_map.get("aria-label"):
+                        self._emit(f"[Aria: {aria_label}] ")
 
         if t in {"h1", "h2", "h3", "h4", "h5", "h6"}:
             level = int(t[1])
@@ -710,8 +723,11 @@ class _CompactHTMLParser(HTMLParser):
                 self._emit("\n")
                 role = attr_map.get("role", "").strip().lower()
                 aria_label = (attr_map.get("aria-label") or attr_map.get("title") or "").strip()
-                if role in {"button", "link", "tab", "menuitem", "switch", "checkbox", "searchbox", "textbox"} and aria_label:
-                    self._emit(f"[{role.capitalize()}: {aria_label}] ")
+                if aria_label:
+                    if role in {"button", "link", "tab", "menuitem", "switch", "checkbox", "searchbox", "textbox", "combobox", "dialog", "region", "navigation"}:
+                        self._emit(f"[{role.capitalize()}: {aria_label}] ")
+                    elif self.browser_mode or "onclick" in attr_map or "tabindex" in attr_map or t == "div":
+                        self._emit(f"[Aria: {aria_label}] ")
         elif t == "br":
             self._emit("\n")
         elif t == "hr":
@@ -787,7 +803,6 @@ class _CompactHTMLParser(HTMLParser):
                 and (
                     norm_hidden_name in _SAFE_HIDDEN_INPUT_NAMES
                     or norm_hidden_name.endswith(("id", "page", "mode", "type", "step", "lang", "locale"))
-                    or (len(value) <= 24 and re.fullmatch(r"[0-9]+|[a-zA-Z0-9_./:-]{1,16}", value) is not None)
                 )
             ):
                 self._emit(f" [Hidden: {name}={value}] ")
@@ -932,7 +947,11 @@ class _CompactHTMLParser(HTMLParser):
             if placeholder and placeholder != name:
                 meta += f' placeholder="{placeholder}"'
             if val:
-                meta += f' value="{val[:80]}"'
+                if _is_sensitive_key(name) or _SENSITIVE_ATTR_RE.search(name) or _SECRET_VALUE_RE.search(val):
+                    meta += " value=<redacted>"
+                else:
+                    scrubbed_val = _scrub_string_value(val, max_str_len=80, redact_secrets=True, key_name=name)
+                    meta += f' value="{scrubbed_val}"'
             self._emit(f"[Textarea: {meta}] ")
         elif t in {"td", "th"} and self._in_cell:
             self._in_cell = False
@@ -1059,17 +1078,25 @@ def html_to_compact_markdown(
 
     if max_chars > 0:
         if struct_section:
-            # Reserve budget for Structured Data so SPA payloads stay intact while honoring max_chars
+            # Reserve budget for Structured Data so SPA payloads stay intact while strictly honoring max_chars
             if len(struct_section) >= max_chars:
                 return struct_section[:max_chars].rstrip()
-            avail_body = max(0, max_chars - len(struct_section) - 48)
+            suffix = "\n\n... [truncated]"
+            avail_body = max(0, max_chars - len(struct_section) - len(suffix) - 2)
             if len(body_text) > avail_body:
-                body_text = body_text[:avail_body].rstrip() + f"\n\n... [body truncated at {avail_body} chars]"
+                body_text = (body_text[:avail_body].rstrip() + suffix) if avail_body > 0 else ""
         elif len(body_text) > max_chars:
-            body_text = body_text[:max_chars].rstrip() + f"\n\n... [body truncated at {max_chars} chars]"
+            suffix = "\n\n... [truncated]"
+            if max_chars <= len(suffix):
+                return body_text[:max_chars]
+            cut = max_chars - len(suffix)
+            body_text = body_text[:cut].rstrip() + suffix
 
     if struct_section:
         body_text = f"{body_text}\n\n{struct_section}".strip() if body_text else struct_section
+
+    if max_chars > 0 and len(body_text) > max_chars:
+        body_text = body_text[:max_chars].rstrip()
 
     return body_text
 
@@ -1297,6 +1324,15 @@ SENSITIVE_JSON_KEYS = {
     "cvc",
     "passphrase",
     "credentials",
+    "credential",
+    "token",
+    "auth",
+    "key",
+    "session",
+    "private",
+    "signature",
+    "sig",
+    "nonce",
 }
 
 SENSITIVE_KEY_NORMS: frozenset[str] = frozenset(
@@ -1336,6 +1372,18 @@ SENSITIVE_KEY_NORM_SUFFIXES: tuple[str, ...] = (
     "passphrase",
     "privatekeypem",
     "clientcertificate",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "apikey",
+    "privatekey",
+    "secretkey",
+    "sessionid",
+    "session",
+    "credential",
+    "credentials",
+    "signature",
 )
 
 _SAFE_TOKEN_KEY_NORMS: frozenset[str] = frozenset(
@@ -1391,7 +1439,7 @@ _SECRET_VALUE_RE = re.compile(
     r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b|"
     r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b|"
     r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)|"
-    r"\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*"
+    r"(?i:\bBearer)\s+[A-Za-z0-9._~+/-]{16,}=*"
     r")"
 )
 
@@ -1586,33 +1634,80 @@ def slim_jsonl_text(
 
 
 def slim_csv_text(
-    csv_text: str,
+    csv_text: str | Path | Iterable[str],
     delimiter: str | None = None,
     head_rows: int = 8,
     tail_rows: int = 5,
     max_cell_len: int = 120,
 ) -> str:
     """
-    Single-pass streaming compressor for large CSV/TSV datasets:
+    Single-pass O(1)-memory streaming compressor for large CSV/TSV datasets:
+    - Accepts a `str`, `Path` (streamed directly from disk), or line iterator (`Iterable[str]`).
     - Keeps header + first `head_rows` + last `tail_rows` (via bounded `deque`).
-    - Computes exact `Decimal` summary statistics (`count`, `min`, `max`, `mean`, `sum`)
+    - Computes 60-digit precision `Decimal` summary statistics (`count`, `min`, `max`, `mean`, `sum`)
       for every numeric column across ALL rows without loading all rows into RAM.
     """
-    if not csv_text.strip():
-        return ""
-
     try:
         csv.field_size_limit(min(sys.maxsize, 134_217_728))
     except OverflowError:
         csv.field_size_limit(134_217_728)
 
-    if delimiter is None:
-        sample_head = csv_text[:4096]
-        nl_idx = sample_head.find("\n")
-        first_line = sample_head[:nl_idx] if nl_idx != -1 else sample_head
-        delimiter = "\t" if first_line.count("\t") > first_line.count(",") else ","
+    file_handle = None
+    try:
+        if isinstance(csv_text, Path):
+            file_handle = csv_text.open("r", encoding="utf-8", errors="replace", newline="")
+            first_line = file_handle.readline()
+            if not first_line:
+                return ""
+            if delimiter is None:
+                delimiter = "\t" if first_line.count("\t") > first_line.count(",") else ","
+            file_handle.seek(0)
+            line_source: Iterable[str] = file_handle
+        elif isinstance(csv_text, str):
+            if not csv_text.strip():
+                return ""
+            if delimiter is None:
+                sample_head = csv_text[:4096]
+                nl_idx = sample_head.find("\n")
+                first_line = sample_head[:nl_idx] if nl_idx != -1 else sample_head
+                delimiter = "\t" if first_line.count("\t") > first_line.count(",") else ","
+            line_source = io.StringIO(csv_text)
+        else:
+            it = iter(csv_text)
+            first_chunk: list[str] = []
+            for ln in it:
+                if ln.strip():
+                    first_chunk.append(ln)
+                    break
+            if not first_chunk:
+                return ""
+            if delimiter is None:
+                delimiter = "\t" if first_chunk[0].count("\t") > first_chunk[0].count(",") else ","
+            def _chain_iter() -> Iterable[str]:
+                yield from first_chunk
+                yield from it
+            line_source = _chain_iter()
 
-    reader = csv.reader(io.StringIO(csv_text), delimiter=delimiter)
+        return _slim_csv_from_iterable(
+            line_source,
+            delimiter=delimiter or ",",
+            head_rows=head_rows,
+            tail_rows=tail_rows,
+            max_cell_len=max_cell_len,
+        )
+    finally:
+        if file_handle is not None:
+            file_handle.close()
+
+
+def _slim_csv_from_iterable(
+    line_source: Iterable[str],
+    delimiter: str = ",",
+    head_rows: int = 8,
+    tail_rows: int = 5,
+    max_cell_len: int = 120,
+) -> str:
+    reader = csv.reader(line_source, delimiter=delimiter)
     try:
         headers = [h.strip() for h in next(reader)]
     except StopIteration:
@@ -1631,52 +1726,66 @@ def slim_csv_text(
     num_max: list[Decimal | None] = [None] * col_count
     num_sum: list[Decimal] = [Decimal(0)] * col_count
 
-    for row in reader:
-        if not any(cell.strip() for cell in row):
-            continue
-        total_rows += 1
-        if len(row) < col_count:
-            row = row + [""] * (col_count - len(row))
-        elif len(row) > col_count:
-            row = row[:col_count]
-
-        if total_rows <= head_rows:
-            head_buffer.append(row)
-        elif tail_rows > 0:
-            tail_deque.append(row)
-
-        for idx, cell in enumerate(row):
-            val_str = cell.strip().replace(",", "").replace("$", "").replace("¥", "")
-            if not val_str:
+    with localcontext() as ctx:
+        ctx.prec = 60
+        for row in reader:
+            if not any(cell.strip() for cell in row):
                 continue
-            try:
-                d_val = Decimal(val_str)
-                if d_val.is_nan() or d_val.is_infinite():
-                    continue
-                num_count[idx] += 1
-                num_sum[idx] += d_val
-                if num_min[idx] is None or d_val < num_min[idx]:
-                    num_min[idx] = d_val
-                if num_max[idx] is None or d_val > num_max[idx]:
-                    num_max[idx] = d_val
-            except (InvalidOperation, ValueError):
-                pass
+            total_rows += 1
+            if len(row) < col_count:
+                row = row + [""] * (col_count - len(row))
+            elif len(row) > col_count:
+                row = row[:col_count]
 
-    def _fmt_dec(d: Decimal) -> str:
-        try:
-            if d == d.to_integral_value():
-                return format(d.to_integral_value(), "f")
-            # Preserve significant decimal precision (e.g. 0.00045 or 1234.5678) without float conversion
-            quantized = d.quantize(Decimal("0.000001")) if abs(d) >= Decimal("0.000001") else d.normalize()
-            s = format(quantized.normalize(), "f")
-            if "." in s:
-                s = s.rstrip("0").rstrip(".")
-            return s or "0"
-        except InvalidOperation:
-            s = format(d.normalize(), "f")
-            if "." in s:
-                s = s.rstrip("0").rstrip(".")
-            return s or "0"
+            if total_rows <= head_rows:
+                head_buffer.append(row)
+            elif tail_rows > 0:
+                tail_deque.append(row)
+
+            for idx, cell in enumerate(row):
+                val_str = cell.strip().replace(",", "").replace("$", "").replace("¥", "").replace("€", "")
+                if not val_str or val_str.endswith("%"):
+                    continue
+                try:
+                    d_val = Decimal(val_str)
+                    if d_val.is_nan() or d_val.is_infinite():
+                        continue
+                    num_count[idx] += 1
+                    num_sum[idx] += d_val
+                    if num_min[idx] is None or d_val < num_min[idx]:
+                        num_min[idx] = d_val
+                    if num_max[idx] is None or d_val > num_max[idx]:
+                        num_max[idx] = d_val
+                except (InvalidOperation, ValueError):
+                    pass
+
+        def _fmt_dec(d: Decimal) -> str:
+            try:
+                norm_d = d.normalize()
+                if norm_d == norm_d.to_integral_value():
+                    return format(norm_d.to_integral_value(), "f")
+                s = format(norm_d, "f")
+                if "." in s:
+                    int_p, frac_p = s.split(".", 1)
+                    if len(frac_p) > 12:
+                        frac_p = frac_p[:12].rstrip("0")
+                    else:
+                        frac_p = frac_p.rstrip("0")
+                    return f"{int_p}.{frac_p}" if frac_p else int_p
+                return s or "0"
+            except InvalidOperation:
+                return str(d)
+
+        stat_lines: list[str] = []
+        for idx, h in enumerate(headers):
+            cnt = num_count[idx]
+            if cnt > 0 and num_min[idx] is not None and num_max[idx] is not None:
+                mean_val = num_sum[idx] / Decimal(cnt)
+                stat_lines.append(
+                    f"- **{h or f'col_{idx}'}** (`n={cnt}`): "
+                    f"min={_fmt_dec(num_min[idx])}, max={_fmt_dec(num_max[idx])}, "
+                    f"mean={_fmt_dec(mean_val)}, sum={_fmt_dec(num_sum[idx])}"
+                )
 
     def _fmt_row(r: list[str]) -> str:
         cells = []
@@ -1689,16 +1798,7 @@ def slim_csv_text(
 
     lines: list[str] = [f"### CSV Summary (`rows={total_rows}`, `columns={col_count}`)"]
 
-    stat_lines: list[str] = []
-    for idx, h in enumerate(headers):
-        cnt = num_count[idx]
-        if cnt > 0 and num_min[idx] is not None and num_max[idx] is not None:
-            mean_val = num_sum[idx] / Decimal(cnt)
-            stat_lines.append(
-                f"- **{h or f'col_{idx}'}** (`n={cnt}`): "
-                f"min={_fmt_dec(num_min[idx])}, max={_fmt_dec(num_max[idx])}, "
-                f"mean={_fmt_dec(mean_val)}, sum={_fmt_dec(num_sum[idx])}"
-            )
+
 
     if stat_lines:
         lines.append("\n**Numeric Column Statistics (across all rows):**")
@@ -1808,25 +1908,20 @@ def slim_git_diff(
                 kept.extend(_trunc_line(x) for x in h_lines)
                 return
 
-            # Preserve all changed lines (+/-) plus +/- 2 surrounding context lines
-            # up to a safety cap of max(max_hunk_lines * 4, 400), collapsing only
-            # long runs of unchanged context lines first.
-            hard_cap = max(max_hunk_lines * 4, 400)
-            must_keep: set[int] = set(range(min(6, len(h_lines))))
-            must_keep.update(range(max(0, len(h_lines) - 6), len(h_lines)))
-            changed_kept = 0
-            for idx, hl in enumerate(h_lines):
-                if hl.startswith(("+", "-", "\\")):
-                    if changed_kept < hard_cap:
-                        changed_kept += 1
-                        for ctx_i in range(max(0, idx - 2), min(len(h_lines), idx + 3)):
-                            must_keep.add(ctx_i)
+            # ALWAYS preserve 100% of changed lines (+/-) so zero code modifications are ever lost!
+            # Only collapse long runs of unchanged context lines (keeping +/- 2 context lines around changes).
+            changed_indices: set[int] = {
+                idx for idx, hl in enumerate(h_lines) if hl.startswith(("+", "-", "\\"))
+            }
+            must_keep: set[int] = set(changed_indices)
+            must_keep.update(range(min(4, len(h_lines))))
+            must_keep.update(range(max(0, len(h_lines) - 4), len(h_lines)))
+            context_radius = 1 if len(changed_indices) > max_hunk_lines else 2
+            for idx in changed_indices:
+                for ctx_i in range(max(0, idx - context_radius), min(len(h_lines), idx + context_radius + 1)):
+                    must_keep.add(ctx_i)
 
             sorted_idx = sorted(must_keep)
-            if len(sorted_idx) > hard_cap:
-                head_part = sorted_idx[: hard_cap // 2]
-                tail_part = sorted_idx[-(hard_cap - len(head_part)) :]
-                sorted_idx = sorted(set(head_part + tail_part))
 
             last_i = -1
             for idx in sorted_idx:
@@ -1877,19 +1972,48 @@ def slim_markdown_body(md_text: str) -> str:
     if not md_text:
         return ""
 
-    # 1. Stash fenced code blocks (```...``` and ~~~...~~~) and inline code (`...`)
+    # 1. Stash fenced code blocks (```...```, ````...````, ~~~...~~~, including fences closed
+    # by >= opening length or unclosed at EOF per CommonMark) and inline code spans (`...`)
     # so HTML comments, URLs, or blank lines inside code examples are 100% untouched.
     stash: list[str] = []
 
-    def _stash_match(m: re.Match[str]) -> str:
+    def _stash_str(s: str) -> str:
         idx = len(stash)
-        stash.append(m.group(0))
+        stash.append(s)
         return f"\x00MDSLIM_CODE_{idx}\x00"
 
+    lines = md_text.splitlines(keepends=True)
+    out_chunks: list[str] = []
+    fence_char: str | None = None
+    fence_len: int = 0
+    fence_buf: list[str] = []
+
+    for ln in lines:
+        if fence_char is None:
+            fm = re.match(r"^[ \t]*(`{3,}|~{3,})", ln)
+            if fm:
+                marker = fm.group(1)
+                fence_char = marker[0]
+                fence_len = len(marker)
+                fence_buf = [ln]
+            else:
+                out_chunks.append(ln)
+        else:
+            fence_buf.append(ln)
+            cm = re.match(rf"^[ \t]*({re.escape(fence_char)}{{{fence_len},}})[ \t]*\r?\n?$", ln)
+            if cm:
+                out_chunks.append(_stash_str("".join(fence_buf)))
+                fence_char = None
+                fence_len = 0
+                fence_buf = []
+
+    if fence_buf:
+        out_chunks.append(_stash_str("".join(fence_buf)))
+
     protected = re.sub(
-        r"(?m)^([ \t]*(`{3,}|~{3,})[^\n]*\n[\s\S]*?^[ \t]*\2[ \t]*$)|(`+[^`\n]+`+)",
-        _stash_match,
-        md_text,
+        r"(`+[^`\n]+`+)",
+        lambda m: _stash_str(m.group(0)),
+        "".join(out_chunks),
     )
 
     cleaned = re.sub(r"<!--[\s\S]*?-->", "", protected)
@@ -2039,9 +2163,11 @@ def compress_cli_output(
     if not raw_output:
         return ""
 
-    # Normalize carriage-return progress updates (keep final segment after \r on each line)
+    # Split on '\n' first so '\r' carriage-return progress overwrites on the same line stay together
     normalized_lines: list[str] = []
-    for raw_ln in raw_output.splitlines():
+    for raw_ln in raw_output.split("\n"):
+        if raw_ln.endswith("\r"):
+            raw_ln = raw_ln[:-1]
         if "\r" in raw_ln:
             segments = [seg for seg in raw_ln.split("\r") if seg.strip()]
             raw_ln = segments[-1] if segments else ""
@@ -2095,11 +2221,16 @@ def compress_cli_output(
         result_lines = []
         last_idx = -1
         for idx in sorted_indices:
-            if last_idx != -1 and idx > last_idx + 1:
+            if last_idx == -1 and idx > 0:
+                result_lines.append(f"... [{idx} normal log lines omitted] ...")
+            elif last_idx != -1 and idx > last_idx + 1:
                 gap = idx - last_idx - 1
                 result_lines.append(f"... [{gap} normal log lines omitted] ...")
             result_lines.append(deduped_lines[idx])
             last_idx = idx
+        if last_idx != -1 and last_idx < total - 1:
+            gap = total - 1 - last_idx
+            result_lines.append(f"... [{gap} normal log lines omitted] ...")
 
     if suppressed_noise_count > 0:
         result_lines.insert(
@@ -2135,39 +2266,62 @@ def run_compressed(
     if not cmd_list:
         return 2, "[token-saver: empty command]"
 
+    max_capture_bytes = 8 * 1024 * 1024  # 8 MB safety ceiling to prevent OOM on runaway child output
     try:
-        proc = subprocess.run(
+        with subprocess.Popen(
             cmd_list,
             shell=False,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            errors="replace",
-            timeout=timeout,
             cwd=cwd,
-        )
-        compressed = compress_cli_output(
-            proc.stdout or "",
-            max_head_lines=max_head_lines,
-            max_tail_lines=max_tail_lines,
-        )
-        return proc.returncode, compressed
+        ) as proc:
+            chunks: list[bytes] = []
+            captured = 0
+            truncated_bytes = 0
+            deadline = time.monotonic() + timeout if timeout and timeout > 0 else None
+            assert proc.stdout is not None
+            while True:
+                if deadline is not None and time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    raw_out = b"".join(chunks).decode("utf-8", "replace")
+                    compressed = compress_cli_output(
+                        raw_out,
+                        max_head_lines=max_head_lines,
+                        max_tail_lines=max_tail_lines,
+                    )
+                    msg = f"[token-saver: command timed out after {timeout}s]\n{compressed}".strip()
+                    return 124, msg
+                buf = proc.stdout.read(65536)
+                if not buf:
+                    break
+                if captured < max_capture_bytes:
+                    take = buf[: max_capture_bytes - captured]
+                    chunks.append(take)
+                    captured += len(take)
+                    if len(buf) > len(take):
+                        truncated_bytes += len(buf) - len(take)
+                else:
+                    truncated_bytes += len(buf)
+            ret = proc.wait(timeout=max(1, int(deadline - time.monotonic())) if deadline else None)
+            raw_out = b"".join(chunks).decode("utf-8", "replace")
+            if truncated_bytes > 0:
+                raw_out += f"\n[token-saver: capped child output after {max_capture_bytes} bytes (+{truncated_bytes} bytes omitted)]\n"
+            compressed = compress_cli_output(
+                raw_out,
+                max_head_lines=max_head_lines,
+                max_tail_lines=max_tail_lines,
+            )
+            return ret, compressed
     except FileNotFoundError:
         return 127, f"[token-saver: command not found: {cmd_list[0]}]"
     except PermissionError:
         return 126, f"[token-saver: permission denied: {cmd_list[0]}]"
-    except subprocess.TimeoutExpired as exc:
-        partial = ""
-        if exc.stdout:
-            partial = exc.stdout.decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout)
-        compressed = compress_cli_output(
-            partial,
-            max_head_lines=max_head_lines,
-            max_tail_lines=max_tail_lines,
-        )
-        msg = f"[token-saver: command timed out after {timeout}s]\n{compressed}".strip()
-        return 124, msg
+    except subprocess.TimeoutExpired:
+        return 124, f"[token-saver: command timed out after {timeout}s]"
+    except OSError as exc:
+        return 126, f"[token-saver: os error executing {cmd_list[0]}: {exc}]"
 
 
 # ---------------------------------------------------------------------------
@@ -2263,7 +2417,19 @@ def batch_slim_files(
 
     out_dir_path = Path(out_dir).resolve() if out_dir else None
     if out_dir_path:
-        out_dir_path.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir_path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return {
+                "files_processed": 0,
+                "files_failed": len(resolved_files),
+                "tokens_before": 0,
+                "tokens_after": 0,
+                "tokens_saved": 0,
+                "saved_pct": 0.0,
+                "error": f"Failed to create output directory '{out_dir}': {exc}",
+                "items": [],
+            }
 
     # Detect duplicate basenames when writing to a shared out_dir
     basename_counts = collections.Counter(f.name for f in resolved_files)
@@ -2288,8 +2454,6 @@ def batch_slim_files(
             browser_mode=browser_mode,
         )
         after_tok = estimate_tokens(slimmed)
-        total_before += before_tok
-        total_after += after_tok
 
         if in_place:
             out_path = fpath
@@ -2316,6 +2480,8 @@ def batch_slim_files(
             results.append({"file": str(fpath), "error": str(exc)})
             continue
 
+        total_before += before_tok
+        total_after += after_tok
         saved_pct = round((1.0 - after_tok / max(1, before_tok)) * 100, 1)
         results.append(
             {
@@ -2435,8 +2601,8 @@ class LocalStateStore:
                         raw_kh = self._hash_key(raw_q, namespace=raw_ns)
                     c_at = float(lrow.get("created_at") or now_ts)
                     e_at = float(lrow.get("expires_at") or (c_at + 21600.0))
-                    t_est = int(lrow.get("token_estimate") or estimate_tokens(raw_val))
-                    h_cnt = int(lrow.get("hit_count") or 0)
+                    t_est = int(lrow.get("token_estimate") or lrow.get("tokens_saved") or estimate_tokens(raw_val))
+                    h_cnt = int(lrow.get("hit_count") or lrow.get("hits") or 0)
                     conn.execute(
                         """
                         INSERT OR REPLACE INTO kv_cache
@@ -3320,6 +3486,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             pass
 
     if args.subcommand == "slim":
+        if args.source != "-" and Path(args.source).is_file() and Path(args.source).suffix.lower() in {".csv", ".tsv"}:
+            p_src = Path(args.source)
+            delim = "\t" if p_src.suffix.lower() == ".tsv" else ","
+            out = slim_csv_text(p_src, delimiter=delim)
+            est_in = max(estimate_tokens(out), p_src.stat().st_size // 4)
+            _record_saving_safe(f"slim:{p_src.suffix.lower().lstrip('.')}", est_in, estimate_tokens(out))
+            print(out)
+            return 0
         raw = _read_input_source(args.source)
         fmt, out = auto_slim(
             raw,
@@ -3354,18 +3528,30 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.subcommand == "json-slim":
         raw = _read_input_source(args.source)
-        out = slim_json_text(
-            raw,
-            max_items=args.max_items,
-            max_str_len=args.max_str_len,
-            max_depth=args.max_depth,
-            indent=2 if args.pretty else None,
-        )
+        try:
+            out = slim_json_text(
+                raw,
+                max_items=args.max_items,
+                max_str_len=args.max_str_len,
+                max_depth=args.max_depth,
+                indent=2 if args.pretty else None,
+            )
+        except json.JSONDecodeError as exc:
+            print(f"[token-saver: invalid JSON input: {exc}]", file=sys.stderr)
+            return 1
         _record_saving_safe("json-slim", estimate_tokens(raw), estimate_tokens(out))
         print(out)
         return 0
 
     if args.subcommand == "jsonl-slim":
+        if args.source != "-" and Path(args.source).is_file():
+            p_src = Path(args.source)
+            with p_src.open("r", encoding="utf-8", errors="replace") as fh:
+                out = slim_jsonl_text(fh, max_records=args.max_records, max_items=args.max_items)
+            est_in = max(estimate_tokens(out), p_src.stat().st_size // 4)
+            _record_saving_safe("jsonl-slim", est_in, estimate_tokens(out))
+            print(out)
+            return 0
         raw = _read_input_source(args.source)
         out = slim_jsonl_text(raw, max_records=args.max_records, max_items=args.max_items)
         _record_saving_safe("jsonl-slim", estimate_tokens(raw), estimate_tokens(out))
@@ -3373,6 +3559,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     if args.subcommand == "csv-slim":
+        if args.source != "-" and Path(args.source).is_file():
+            p_src = Path(args.source)
+            out = slim_csv_text(p_src, head_rows=args.head, tail_rows=args.tail)
+            est_in = max(estimate_tokens(out), p_src.stat().st_size // 4)
+            _record_saving_safe("csv-slim", est_in, estimate_tokens(out))
+            print(out)
+            return 0
         raw = _read_input_source(args.source)
         out = slim_csv_text(raw, head_rows=args.head, tail_rows=args.tail)
         _record_saving_safe("csv-slim", estimate_tokens(raw), estimate_tokens(out))
